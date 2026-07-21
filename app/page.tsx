@@ -1,12 +1,59 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
-import Cropper, { type Area, type Size } from "react-easy-crop";
+import Cropper, { type Area, type MediaSize, type Size } from "react-easy-crop";
 import { upload } from "@vercel/blob/client";
 import { PALETTE } from "@/lib/colors";
 import { ChromeOverlayPreview } from "./chrome-overlay-preview";
 
 type Status = "idle" | "uploading" | "processing" | "done" | "error";
+
+const MIN_CROP_WIDTH = 1080;
+const MIN_CROP_HEIGHT = 1350;
+
+function pad2(n: number) {
+  return String(n).padStart(2, "0");
+}
+
+function buildStamps(d: Date) {
+  const dateStamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
+  const timestamp = `${dateStamp}${pad2(d.getHours())}${pad2(d.getMinutes())}`;
+  return { dateStamp, timestamp };
+}
+
+function ColorPicker({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (hex: string) => void;
+}) {
+  return (
+    <div>
+      <p className="mb-2 text-sm uppercase tracking-[0.1em] text-[#6f6a60]">{label}</p>
+      <div className="grid grid-cols-3 gap-2">
+        {PALETTE.map((c) => (
+          <button
+            key={c.hex}
+            type="button"
+            onClick={() => onChange(c.hex)}
+            className={`flex items-center gap-2 border px-2 py-2 text-left text-xs ${
+              value === c.hex ? "border-[#16140f]" : "border-[#16140f]/20"
+            }`}
+          >
+            <span
+              className="h-4 w-4 shrink-0 rounded-full border border-black/10"
+              style={{ backgroundColor: c.hex }}
+            />
+            {c.name}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
@@ -14,11 +61,15 @@ export default function Home() {
   const [cropEnabled, setCropEnabled] = useState(true);
   const [crop, setCrop] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(1);
+  const [maxZoom, setMaxZoom] = useState(3);
   const [croppedAreaPixels, setCroppedAreaPixels] = useState<Area | null>(null);
   const [cropBoxSize, setCropBoxSize] = useState<Size | null>(null);
-  const [color, setColor] = useState<string>(PALETTE[4].hex);
+  const [topColor, setTopColor] = useState<string>(PALETTE[4].hex);
+  const [bottomColor, setBottomColor] = useState<string>(PALETTE[4].hex);
   const [status, setStatus] = useState<Status>("idle");
+  const [resultBlob, setResultBlob] = useState<Blob | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
+  const [resultFilename, setResultFilename] = useState<string>("Branded_photo.png");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const previewImgRef = useRef<HTMLImageElement>(null);
@@ -31,9 +82,11 @@ export default function Home() {
     setPreviewUrl(URL.createObjectURL(f));
     setCrop({ x: 0, y: 0 });
     setZoom(1);
+    setMaxZoom(3);
     setCroppedAreaPixels(null);
     setCropBoxSize(null);
     setPreviewImgSize(null);
+    setResultBlob(null);
     setResultUrl(null);
     setStatus("idle");
     setErrorMsg(null);
@@ -41,6 +94,12 @@ export default function Home() {
 
   const onCropComplete = useCallback((_area: Area, areaPixels: Area) => {
     setCroppedAreaPixels(areaPixels);
+  }, []);
+
+  const onMediaLoaded = useCallback((mediaSize: MediaSize) => {
+    const byWidth = mediaSize.naturalWidth / MIN_CROP_WIDTH;
+    const byHeight = mediaSize.naturalHeight / MIN_CROP_HEIGHT;
+    setMaxZoom(Math.max(1, Math.min(3, byWidth, byHeight)));
   }, []);
 
   useEffect(() => {
@@ -67,12 +126,16 @@ export default function Home() {
       });
 
       setStatus("processing");
+      const { dateStamp, timestamp } = buildStamps(new Date());
       const res = await fetch("/api/overlay", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           blobUrl: blob.url,
-          color,
+          topColor,
+          bottomColor,
+          dateStamp,
+          timestamp,
           crop:
             cropEnabled && croppedAreaPixels
               ? {
@@ -90,12 +153,38 @@ export default function Home() {
       }
 
       const outBlob = await res.blob();
+      setResultBlob(outBlob);
       setResultUrl(URL.createObjectURL(outBlob));
+      setResultFilename(`${timestamp}_Branded_photo.png`);
       setStatus("done");
     } catch (err) {
       setStatus("error");
       setErrorMsg(err instanceof Error ? err.message : "Something went wrong");
     }
+  }
+
+  async function onSaveToPhotos() {
+    if (!resultBlob) return;
+    const shareFile = new File([resultBlob], resultFilename, { type: "image/png" });
+
+    if (
+      typeof navigator.canShare === "function" &&
+      navigator.canShare({ files: [shareFile] })
+    ) {
+      try {
+        await navigator.share({ files: [shareFile] });
+        return;
+      } catch {
+        // User cancelled or share failed — fall through to download.
+      }
+    }
+
+    const url = URL.createObjectURL(resultBlob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = resultFilename;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   const busy = status === "uploading" || status === "processing";
@@ -112,7 +201,6 @@ export default function Home() {
           <input
             type="file"
             accept="image/*"
-            capture="environment"
             className="hidden"
             onChange={onFileChange}
           />
@@ -130,16 +218,22 @@ export default function Home() {
             </label>
 
             {cropEnabled ? (
-              <div className="relative h-[60vh] w-full bg-black/5">
+              <div
+                className="relative h-[60vh] w-full bg-black/5"
+                style={{ touchAction: "none" }}
+              >
                 <Cropper
                   image={previewUrl}
                   crop={crop}
                   zoom={zoom}
+                  minZoom={1}
+                  maxZoom={maxZoom}
                   aspect={4 / 5}
                   onCropChange={setCrop}
                   onZoomChange={setZoom}
                   onCropComplete={onCropComplete}
                   onCropSizeChange={setCropBoxSize}
+                  onMediaLoaded={onMediaLoaded}
                 />
                 {cropBoxSize && (
                   <div
@@ -153,7 +247,8 @@ export default function Home() {
                     <ChromeOverlayPreview
                       width={cropBoxSize.width}
                       height={cropBoxSize.height}
-                      color={color}
+                      topColor={topColor}
+                      bottomColor={bottomColor}
                     />
                   </div>
                 )}
@@ -171,7 +266,8 @@ export default function Home() {
                   <ChromeOverlayPreview
                     width={previewImgSize.width}
                     height={previewImgSize.height}
-                    color={color}
+                    topColor={topColor}
+                    bottomColor={bottomColor}
                   />
                 )}
               </div>
@@ -179,29 +275,8 @@ export default function Home() {
           </>
         )}
 
-        <div>
-          <p className="mb-2 text-sm uppercase tracking-[0.1em] text-[#6f6a60]">
-            Text color
-          </p>
-          <div className="grid grid-cols-3 gap-2">
-            {PALETTE.map((c) => (
-              <button
-                key={c.hex}
-                type="button"
-                onClick={() => setColor(c.hex)}
-                className={`flex items-center gap-2 border px-2 py-2 text-left text-xs ${
-                  color === c.hex ? "border-[#16140f]" : "border-[#16140f]/20"
-                }`}
-              >
-                <span
-                  className="h-4 w-4 shrink-0 rounded-full border border-black/10"
-                  style={{ backgroundColor: c.hex }}
-                />
-                {c.name}
-              </button>
-            ))}
-          </div>
-        </div>
+        <ColorPicker label="Top line color" value={topColor} onChange={setTopColor} />
+        <ColorPicker label="Bottom line color" value={bottomColor} onChange={setBottomColor} />
 
         <button
           type="button"
@@ -222,13 +297,13 @@ export default function Home() {
           <div className="space-y-3">
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src={resultUrl} alt="Branded result" className="w-full" />
-            <a
-              href={resultUrl}
-              download="sax-playing-dog.png"
+            <button
+              type="button"
+              onClick={onSaveToPhotos}
               className="block w-full bg-[#d9a441] py-3 text-center text-sm uppercase tracking-[0.14em] text-[#16140f]"
             >
-              Download full quality
-            </a>
+              Save to Photos
+            </button>
           </div>
         )}
       </div>

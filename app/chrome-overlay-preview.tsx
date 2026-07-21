@@ -10,11 +10,13 @@ const mono = IBM_Plex_Mono({ weight: "400", subsets: ["latin"] });
 export function ChromeOverlayPreview({
   width,
   height,
-  color,
+  topColor,
+  bottomColor,
 }: {
   width: number;
   height: number;
-  color: string;
+  topColor: string;
+  bottomColor: string;
 }) {
   if (!width || !height) return null;
 
@@ -23,7 +25,7 @@ export function ChromeOverlayPreview({
   const fontSize = shorterEdge * FONT_SIZE_RATIO;
   const boxHeight = fontSize * BOX_HEIGHT_RATIO;
 
-  const lineStyle = (top: number): CSSProperties => ({
+  const lineStyle = (top: number, color: string): CSSProperties => ({
     position: "absolute",
     left: pad,
     top,
@@ -42,8 +44,10 @@ export function ChromeOverlayPreview({
       className={mono.className}
       style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
     >
-      <span style={lineStyle(pad)}>{CHROME.topLeft}</span>
-      <span style={lineStyle(height - pad - boxHeight)}>{CHROME.bottomLeft}</span>
+      <span style={lineStyle(pad, topColor)}>{CHROME.topLeft}</span>
+      <span style={lineStyle(height - pad - boxHeight, bottomColor)}>
+        {CHROME.bottomLeft}
+      </span>
     </div>
   );
 }
