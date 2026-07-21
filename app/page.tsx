@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useState, type ChangeEvent } from "react";
-import Cropper, { type Area } from "react-easy-crop";
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
+import Cropper, { type Area, type Size } from "react-easy-crop";
 import { upload } from "@vercel/blob/client";
 import { PALETTE } from "@/lib/colors";
+import { ChromeOverlayPreview } from "./chrome-overlay-preview";
 
 type Status = "idle" | "uploading" | "processing" | "done" | "error";
 
@@ -14,10 +15,14 @@ export default function Home() {
   const [crop, setCrop] = useState({ x: 0, y: 0 });
   const [zoom, setZoom] = useState(1);
   const [croppedAreaPixels, setCroppedAreaPixels] = useState<Area | null>(null);
+  const [cropBoxSize, setCropBoxSize] = useState<Size | null>(null);
   const [color, setColor] = useState<string>(PALETTE[4].hex);
   const [status, setStatus] = useState<Status>("idle");
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const previewImgRef = useRef<HTMLImageElement>(null);
+  const [previewImgSize, setPreviewImgSize] = useState<Size | null>(null);
 
   function onFileChange(e: ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
@@ -27,6 +32,8 @@ export default function Home() {
     setCrop({ x: 0, y: 0 });
     setZoom(1);
     setCroppedAreaPixels(null);
+    setCropBoxSize(null);
+    setPreviewImgSize(null);
     setResultUrl(null);
     setStatus("idle");
     setErrorMsg(null);
@@ -35,6 +42,18 @@ export default function Home() {
   const onCropComplete = useCallback((_area: Area, areaPixels: Area) => {
     setCroppedAreaPixels(areaPixels);
   }, []);
+
+  useEffect(() => {
+    if (cropEnabled) return;
+    const img = previewImgRef.current;
+    if (!img) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setPreviewImgSize({ width, height });
+    });
+    observer.observe(img);
+    return () => observer.disconnect();
+  }, [cropEnabled, previewUrl]);
 
   async function onSubmit() {
     if (!file) return;
@@ -120,11 +139,42 @@ export default function Home() {
                   onCropChange={setCrop}
                   onZoomChange={setZoom}
                   onCropComplete={onCropComplete}
+                  onCropSizeChange={setCropBoxSize}
                 />
+                {cropBoxSize && (
+                  <div
+                    className="pointer-events-none absolute left-1/2 top-1/2"
+                    style={{
+                      width: cropBoxSize.width,
+                      height: cropBoxSize.height,
+                      transform: "translate(-50%, -50%)",
+                    }}
+                  >
+                    <ChromeOverlayPreview
+                      width={cropBoxSize.width}
+                      height={cropBoxSize.height}
+                      color={color}
+                    />
+                  </div>
+                )}
               </div>
             ) : (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={previewUrl} alt="Selected photo preview" className="w-full" />
+              <div className="relative">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  ref={previewImgRef}
+                  src={previewUrl}
+                  alt="Selected photo preview"
+                  className="w-full"
+                />
+                {previewImgSize && (
+                  <ChromeOverlayPreview
+                    width={previewImgSize.width}
+                    height={previewImgSize.height}
+                    color={color}
+                  />
+                )}
+              </div>
             )}
           </>
         )}

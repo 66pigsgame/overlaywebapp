@@ -3,12 +3,7 @@ import sharp from "sharp";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { CHROME } from "./colors";
-
-// 1080px-wide reference canvas from social/first-post/geometry.json:
-// pad 34px * scale 2 = 68px, mono font-size 11px * scale 2 = 22px.
-const PAD_RATIO = 68 / 1080;
-const FONT_SIZE_RATIO = 22 / 1080;
-const LETTER_SPACING_EM = 0.14;
+import { PAD_RATIO, FONT_SIZE_RATIO, LETTER_SPACING_EM, BOX_HEIGHT_RATIO } from "./geometry";
 
 export interface CropRect {
   left: number;
@@ -90,7 +85,7 @@ export async function applyBrandOverlay(
   const pad = Math.round(shorterEdge * PAD_RATIO);
   const fontSize = Math.round(shorterEdge * FONT_SIZE_RATIO);
   const boxWidth = width - pad * 2;
-  const boxHeight = Math.round(fontSize * 1.8);
+  const boxHeight = Math.round(fontSize * BOX_HEIGHT_RATIO);
 
   const [topPng, bottomPng] = await Promise.all([
     renderChromeLine(CHROME.topLeft, opts.color, fontSize, boxWidth, boxHeight),
