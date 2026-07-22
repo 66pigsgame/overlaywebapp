@@ -1,38 +1,60 @@
 import { spawn } from "node:child_process";
-import { chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import ffmpegPathRaw from "ffmpeg-static";
+import { pipeline } from "node:stream/promises";
+import { createGunzip } from "node:zlib";
 import { CHROME } from "./colors";
 import { PAD_RATIO, FONT_SIZE_RATIO, BOX_HEIGHT_RATIO } from "./geometry";
 import { renderChromeLine } from "./chrome-render";
 
-if (!ffmpegPathRaw) {
-  throw new Error("ffmpeg-static did not resolve a binary path for this platform");
-}
-const bundledFfmpegPath: string = ffmpegPathRaw;
+// After three separate failures getting any file-traced binary (ffprobe-static,
+// then ffmpeg-static) to actually exist in the deployed function bundle on
+// this project's Next 16 + Turbopack + Vercel setup, this sidesteps build-time
+// bundling entirely: fetch a known-good static ffmpeg binary over HTTP into
+// /tmp on first use instead. Zero dependency on Next's file tracing.
+//
+// Reuses the exact release the (now-removed) ffmpeg-static package itself
+// downloads from, pinned to a specific version and platform/arch (Vercel's
+// Node.js serverless functions run linux/x64).
+const FFMPEG_DOWNLOAD_URL =
+  "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-linux-x64.gz";
 
-// Vercel's serverless packaging doesn't reliably preserve the executable
-// bit on file-traced binaries, and the bundle's own directory can be
-// read-only at runtime. Copy the binary into /tmp (writable) and chmod
-// it there once per cold start; cached so repeat calls are free.
-let executableCache: Promise<string> | null = null;
-function ensureExecutable(bundledPath: string): Promise<string> {
-  if (!executableCache) {
-    executableCache = (async () => {
-      const target = path.join(tmpdir(), path.basename(bundledPath));
-      try {
-        const info = await stat(target);
-        if (info.mode & 0o111) return target;
-      } catch {
-        // Not there yet -- fall through to copy it.
-      }
-      await copyFile(bundledPath, target);
-      await chmod(target, 0o755);
-      return target;
-    })();
-  }
-  return executableCache;
+let ffmpegPathCache: Promise<string> | null = null;
+function resolveFfmpeg(): Promise<string> {
+  if (ffmpegPathCache) return ffmpegPathCache;
+
+  ffmpegPathCache = (async () => {
+    // Local dev/testing escape hatch -- point at a real local ffmpeg
+    // instead of downloading a Linux binary that won't run on this machine.
+    if (process.env.FFMPEG_BIN_OVERRIDE) {
+      return process.env.FFMPEG_BIN_OVERRIDE;
+    }
+
+    const target = path.join(tmpdir(), "ffmpeg");
+    try {
+      const info = await stat(target);
+      if (info.size > 0 && info.mode & 0o111) return target;
+    } catch {
+      // Not there yet -- fall through to download it.
+    }
+
+    const res = await fetch(FFMPEG_DOWNLOAD_URL);
+    if (!res.ok || !res.body) {
+      throw new Error(`Failed to download ffmpeg binary: HTTP ${res.status}`);
+    }
+    const { Readable } = await import("node:stream");
+    await pipeline(
+      Readable.fromWeb(res.body as import("node:stream/web").ReadableStream<Uint8Array>),
+      createGunzip(),
+      createWriteStream(target),
+    );
+    await chmod(target, 0o755);
+    return target;
+  })();
+
+  return ffmpegPathCache;
 }
 
 export interface CropRect {
@@ -84,15 +106,10 @@ interface ProbeResult {
 }
 
 // Uses ffmpeg's own stderr analysis output instead of a separate ffprobe
-// binary -- ffprobe-static ships a ~340MB all-platforms bundle that hasn't
-// survived Vercel's build pipeline (confirmed via two separate failures:
-// first the traced binary was missing at spawn time, then even an explicit
-// outputFileTracingIncludes entry didn't make the source file exist for a
-// copy). ffmpeg-static's single flat (non-platform-segmented) binary path
-// has traced and run correctly in both of those attempts, so this drops
-// the fragile dependency rather than patching around it again.
+// binary -- see the resolveFfmpeg() comment above for why no bundled
+// binary is used for either tool.
 async function probeVideo(filePath: string): Promise<ProbeResult> {
-  const ffmpegPath = await ensureExecutable(bundledFfmpegPath);
+  const ffmpegPath = await resolveFfmpeg();
   const stderr = await runFfmpegStderr(ffmpegPath, [
     "-i",
     filePath,
@@ -236,7 +253,7 @@ export async function applyVideoBrandOverlay(
       outputPath,
     );
 
-    const ffmpegPath = await ensureExecutable(bundledFfmpegPath);
+    const ffmpegPath = await resolveFfmpeg();
     await run(ffmpegPath, args);
 
     return await readFile(outputPath);
