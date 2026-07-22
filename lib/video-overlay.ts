@@ -1,17 +1,43 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import ffmpegPathRaw from "ffmpeg-static";
 import ffprobeStatic from "ffprobe-static";
+import { CHROME } from "./colors";
+import { PAD_RATIO, FONT_SIZE_RATIO, BOX_HEIGHT_RATIO } from "./geometry";
+import { renderChromeLine } from "./chrome-render";
 
 if (!ffmpegPathRaw) {
   throw new Error("ffmpeg-static did not resolve a binary path for this platform");
 }
-const ffmpegPath: string = ffmpegPathRaw;
-import { CHROME } from "./colors";
-import { PAD_RATIO, FONT_SIZE_RATIO, BOX_HEIGHT_RATIO } from "./geometry";
-import { renderChromeLine } from "./chrome-render";
+const bundledFfmpegPath: string = ffmpegPathRaw;
+const bundledFfprobePath: string = ffprobeStatic.path;
+
+// Vercel's serverless packaging doesn't reliably preserve the executable
+// bit on file-traced binaries, and the bundle's own directory can be
+// read-only at runtime. Copy each binary into /tmp (writable) and chmod
+// it there once per cold start; cached so repeat calls are free.
+const executableCache = new Map<string, Promise<string>>();
+function ensureExecutable(bundledPath: string): Promise<string> {
+  let cached = executableCache.get(bundledPath);
+  if (!cached) {
+    cached = (async () => {
+      const target = path.join(tmpdir(), path.basename(bundledPath));
+      try {
+        const info = await stat(target);
+        if (info.mode & 0o111) return target;
+      } catch {
+        // Not there yet -- fall through to copy it.
+      }
+      await copyFile(bundledPath, target);
+      await chmod(target, 0o755);
+      return target;
+    })();
+    executableCache.set(bundledPath, cached);
+  }
+  return cached;
+}
 
 export interface CropRect {
   left: number;
@@ -57,7 +83,8 @@ interface ProbeResult {
 }
 
 async function probeVideo(filePath: string): Promise<ProbeResult> {
-  const stdout = await run(ffprobeStatic.path, [
+  const ffprobePath = await ensureExecutable(bundledFfprobePath);
+  const stdout = await run(ffprobePath, [
     "-v",
     "error",
     "-print_format",
@@ -196,6 +223,7 @@ export async function applyVideoBrandOverlay(
       outputPath,
     );
 
+    const ffmpegPath = await ensureExecutable(bundledFfmpegPath);
     await run(ffmpegPath, args);
 
     return await readFile(outputPath);
