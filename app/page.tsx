@@ -223,6 +223,7 @@ export default function Home() {
                 style={{ touchAction: "none" }}
               >
                 <Cropper
+                  key={previewUrl}
                   image={previewUrl}
                   crop={crop}
                   zoom={zoom}
