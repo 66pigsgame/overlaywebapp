@@ -6,8 +6,13 @@ import { upload } from "@vercel/blob/client";
 import { PALETTE } from "@/lib/colors";
 import { ChromeOverlayPreview } from "@/app/chrome-overlay-preview";
 import { QUALITY_PRESETS, QUALITY_KEYS, DEFAULT_QUALITY, type QualityKey } from "@/lib/video-quality";
+import type { EncodeEstimate, CropRect } from "@/lib/video-overlay";
 
-type Status = "idle" | "uploading" | "processing" | "done" | "error";
+type Status = "idle" | "uploading" | "estimating" | "processing" | "done" | "error";
+
+function formatSeconds(n: number): string {
+  return n < 10 ? n.toFixed(1) : Math.round(n).toString();
+}
 
 const MIN_CROP_WIDTH = 1080;
 const MIN_CROP_HEIGHT = 1350;
@@ -107,6 +112,9 @@ export default function VideoPage() {
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [resultFilename, setResultFilename] = useState<string>("Branded_video.mp4");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [pendingEstimate, setPendingEstimate] = useState<EncodeEstimate | null>(null);
+  const [pendingBlobUrl, setPendingBlobUrl] = useState<string | null>(null);
+  const [pendingCrop, setPendingCrop] = useState<CropRect | undefined>(undefined);
 
   const previewVideoRef = useRef<HTMLVideoElement>(null);
   const [previewVideoSize, setPreviewVideoSize] = useState<Size | null>(null);
@@ -126,6 +134,9 @@ export default function VideoPage() {
     setResultUrl(null);
     setStatus("idle");
     setErrorMsg(null);
+    setPendingEstimate(null);
+    setPendingBlobUrl(null);
+    setPendingCrop(undefined);
   }
 
   const onCropComplete = useCallback((_area: Area, areaPixels: Area) => {
@@ -150,38 +161,21 @@ export default function VideoPage() {
     return () => observer.disconnect();
   }, [cropEnabled, previewUrl]);
 
-  async function onSubmit() {
-    if (!file) return;
-    setErrorMsg(null);
+  async function runEncode(blobUrl: string, crop: CropRect | undefined, useQuality: QualityKey) {
     try {
-      setStatus("uploading");
-      const blob = await upload(file.name, file, {
-        access: "public",
-        handleUploadUrl: "/api/blob-upload",
-        multipart: true,
-      });
-
       setStatus("processing");
       const { dateStamp, timestamp } = buildStamps(new Date());
       const res = await fetch("/api/video-overlay", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          blobUrl: blob.url,
+          blobUrl,
           topColor,
           bottomColor,
-          quality,
+          quality: useQuality,
           dateStamp,
           timestamp,
-          crop:
-            cropEnabled && croppedAreaPixels
-              ? {
-                  left: croppedAreaPixels.x,
-                  top: croppedAreaPixels.y,
-                  width: croppedAreaPixels.width,
-                  height: croppedAreaPixels.height,
-                }
-              : undefined,
+          crop,
         }),
       });
 
@@ -220,6 +214,66 @@ export default function VideoPage() {
     }
   }
 
+  async function onSubmit() {
+    if (!file) return;
+    setErrorMsg(null);
+    setPendingEstimate(null);
+    try {
+      setStatus("uploading");
+      const blob = await upload(file.name, file, {
+        access: "public",
+        handleUploadUrl: "/api/blob-upload",
+        multipart: true,
+      });
+
+      const crop: CropRect | undefined =
+        cropEnabled && croppedAreaPixels
+          ? {
+              left: croppedAreaPixels.x,
+              top: croppedAreaPixels.y,
+              width: croppedAreaPixels.width,
+              height: croppedAreaPixels.height,
+            }
+          : undefined;
+
+      setStatus("estimating");
+      let estimate: EncodeEstimate | null = null;
+      try {
+        const estRes = await fetch("/api/video-estimate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ blobUrl: blob.url, crop }),
+        });
+        if (estRes.ok) {
+          estimate = (await estRes.json()) as EncodeEstimate;
+        }
+      } catch {
+        // Estimation is a nice-to-have -- if it fails for any reason, just
+        // proceed straight to the real encode with the chosen tier.
+      }
+
+      if (estimate && !estimate.fitsBudget[quality]) {
+        setPendingEstimate(estimate);
+        setPendingBlobUrl(blob.url);
+        setPendingCrop(crop);
+        setStatus("idle");
+        return;
+      }
+
+      await runEncode(blob.url, crop, quality);
+    } catch (err) {
+      setStatus("error");
+      setErrorMsg(err instanceof Error ? err.message : "Something went wrong");
+    }
+  }
+
+  function confirmPending(useQuality: QualityKey) {
+    if (!pendingBlobUrl) return;
+    setQuality(useQuality);
+    setPendingEstimate(null);
+    void runEncode(pendingBlobUrl, pendingCrop, useQuality);
+  }
+
   async function onSaveToPhotos() {
     if (!resultBlob) return;
     const shareFile = new File([resultBlob], resultFilename, { type: "video/mp4" });
@@ -244,7 +298,7 @@ export default function VideoPage() {
     URL.revokeObjectURL(url);
   }
 
-  const busy = status === "uploading" || status === "processing";
+  const busy = status === "uploading" || status === "estimating" || status === "processing";
 
   return (
     <main className="min-h-screen bg-[#f1ece1] px-4 py-8 text-[#16140f]">
@@ -347,10 +401,44 @@ export default function VideoPage() {
         >
           {status === "uploading"
             ? "Uploading..."
-            : status === "processing"
-              ? "Branding..."
-              : "Brand it"}
+            : status === "estimating"
+              ? "Estimating..."
+              : status === "processing"
+                ? "Branding..."
+                : "Brand it"}
         </button>
+
+        {pendingEstimate && (
+          <div className="border border-[#16140f]/30 bg-white p-3 text-sm">
+            <p>
+              <strong className="uppercase tracking-[0.05em]">
+                {QUALITY_PRESETS[quality].label}
+              </strong>{" "}
+              is estimated at ~{formatSeconds(pendingEstimate.estimates[quality])}s, over the 60s
+              limit. Recommended:{" "}
+              <strong className="uppercase tracking-[0.05em]">
+                {QUALITY_PRESETS[pendingEstimate.recommended].label}
+              </strong>{" "}
+              (~{formatSeconds(pendingEstimate.estimates[pendingEstimate.recommended])}s).
+            </p>
+            <div className="mt-3 flex gap-2">
+              <button
+                type="button"
+                onClick={() => confirmPending(pendingEstimate.recommended)}
+                className="flex-1 bg-[#1a1a1a] py-2 text-xs uppercase tracking-[0.1em] text-[#f1ece1]"
+              >
+                Use {QUALITY_PRESETS[pendingEstimate.recommended].label}
+              </button>
+              <button
+                type="button"
+                onClick={() => confirmPending(quality)}
+                className="flex-1 border border-[#16140f]/30 py-2 text-xs uppercase tracking-[0.1em]"
+              >
+                Try {QUALITY_PRESETS[quality].label} anyway
+              </button>
+            </div>
+          </div>
+        )}
 
         {errorMsg && <p className="text-center text-sm text-red-700">{errorMsg}</p>}
 

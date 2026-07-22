@@ -8,7 +8,12 @@ import { createGunzip } from "node:zlib";
 import { CHROME } from "./colors";
 import { PAD_RATIO, FONT_SIZE_RATIO, BOX_HEIGHT_RATIO } from "./geometry";
 import { renderChromeLine } from "./chrome-render";
-import { QUALITY_PRESETS, DEFAULT_QUALITY, type QualityKey } from "./video-quality";
+import {
+  QUALITY_PRESETS,
+  QUALITY_KEYS,
+  DEFAULT_QUALITY,
+  type QualityKey,
+} from "./video-quality";
 
 // After three separate failures getting any file-traced binary (ffprobe-static,
 // then ffmpeg-static) to actually exist in the deployed function bundle on
@@ -66,6 +71,11 @@ export interface CropRect {
 }
 
 export const MAX_VIDEO_DURATION_SECONDS = 20;
+
+// Vercel Hobby's function duration is hard-capped at 60s; this is the target
+// ceiling for the actual encode step, leaving headroom for blob fetch, probe,
+// calibration, PNG rendering, and the upload of the result.
+export const SAFE_ENCODE_BUDGET_SECONDS = 45;
 
 export class VideoTooLargeError extends Error {}
 
@@ -155,6 +165,16 @@ async function probeVideo(filePath: string): Promise<ProbeResult> {
   return { width, height, duration, hasAudio };
 }
 
+interface PreparedEncode {
+  workDir: string;
+  inputPath: string;
+  topPngPath: string;
+  bottomPngPath: string;
+  filterComplex: string;
+  duration: number;
+  hasAudio: boolean;
+}
+
 export interface VideoOverlayOptions {
   crop?: CropRect;
   topColor: string;
@@ -163,105 +183,200 @@ export interface VideoOverlayOptions {
   quality?: QualityKey;
 }
 
-export async function applyVideoBrandOverlay(
+// Shared setup for both the real encode and the calibration pass: writes the
+// input, probes it, computes crop/pad/font geometry, renders the two chrome
+// PNGs, and builds the filter graph string. Both callers own workDir cleanup.
+async function prepareEncode(
   input: Buffer,
-  opts: VideoOverlayOptions,
-): Promise<Buffer> {
+  opts: { crop?: CropRect; topColor: string; bottomColor: string },
+): Promise<PreparedEncode> {
   const workDir = await mkdtemp(path.join(tmpdir(), "spd-video-"));
   const inputPath = path.join(workDir, "input.mp4");
   const topPngPath = path.join(workDir, "top.png");
   const bottomPngPath = path.join(workDir, "bottom.png");
-  const outputPath = path.join(workDir, "output.mp4");
 
-  try {
-    await writeFile(inputPath, input);
+  await writeFile(inputPath, input);
 
-    const probe = await probeVideo(inputPath);
+  const probe = await probeVideo(inputPath);
 
-    if (probe.duration > MAX_VIDEO_DURATION_SECONDS) {
-      throw new VideoTooLargeError(
-        `Video is ${probe.duration.toFixed(1)}s, max is ${MAX_VIDEO_DURATION_SECONDS}s`,
-      );
-    }
-
-    let width = probe.width;
-    let height = probe.height;
-    let cropFilter = "";
-
-    if (opts.crop) {
-      const left = Math.round(opts.crop.left);
-      const top = Math.round(opts.crop.top);
-      const cropWidth = Math.round(opts.crop.width);
-      const cropHeight = Math.round(opts.crop.height);
-      cropFilter = `crop=${cropWidth}:${cropHeight}:${left}:${top}`;
-      width = cropWidth;
-      height = cropHeight;
-    }
-
-    const shorterEdge = Math.min(width, height);
-    const pad = Math.round(shorterEdge * PAD_RATIO);
-    const fontSize = Math.round(shorterEdge * FONT_SIZE_RATIO);
-    const boxWidth = width - pad * 2;
-    const boxHeight = Math.round(fontSize * BOX_HEIGHT_RATIO);
-
-    const [topPng, bottomPng] = await Promise.all([
-      renderChromeLine(CHROME.topLeft, opts.topColor, fontSize, boxWidth, boxHeight),
-      renderChromeLine(CHROME.bottomLeft, opts.bottomColor, fontSize, boxWidth, boxHeight),
-    ]);
-    await Promise.all([writeFile(topPngPath, topPng), writeFile(bottomPngPath, bottomPng)]);
-
-    const filterParts: string[] = [];
-    if (cropFilter) {
-      filterParts.push(`[0:v]${cropFilter}[cropped]`);
-      filterParts.push(`[cropped][1:v]overlay=${pad}:${pad}[tmp]`);
-    } else {
-      filterParts.push(`[0:v][1:v]overlay=${pad}:${pad}[tmp]`);
-    }
-    filterParts.push(`[tmp][2:v]overlay=${pad}:${height - pad - boxHeight}[outv]`);
-
-    const args = [
-      "-y",
-      "-i",
-      inputPath,
-      "-i",
-      topPngPath,
-      "-i",
-      bottomPngPath,
-      "-filter_complex",
-      filterParts.join(";"),
-      "-map",
-      "[outv]",
-    ];
-    if (probe.hasAudio) {
-      // Map only the first audio stream (not `0:a?`, which pulls in every
-      // audio-typed stream) and always transcode to AAC instead of stream
-      // copy -- some sources (confirmed with a Mac Photos export) carry a
-      // second audio track whose codec has no valid MP4 tag when copied,
-      // which fails the whole mux ("Could not find tag for codec ... not
-      // currently supported in container"). AAC is always MP4-safe and is
-      // what Instagram expects anyway.
-      args.push("-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k");
-    }
-    const { crf, preset } = QUALITY_PRESETS[opts.quality ?? DEFAULT_QUALITY];
-    args.push(
-      "-c:v",
-      "libx264",
-      "-preset",
-      preset,
-      "-crf",
-      String(crf),
-      "-pix_fmt",
-      "yuv420p",
-      "-metadata",
-      `comment=${opts.altText}`,
-      outputPath,
+  if (probe.duration > MAX_VIDEO_DURATION_SECONDS) {
+    throw new VideoTooLargeError(
+      `Video is ${probe.duration.toFixed(1)}s, max is ${MAX_VIDEO_DURATION_SECONDS}s`,
     );
+  }
+
+  let width = probe.width;
+  let height = probe.height;
+  let cropFilter = "";
+
+  if (opts.crop) {
+    const left = Math.round(opts.crop.left);
+    const top = Math.round(opts.crop.top);
+    const cropWidth = Math.round(opts.crop.width);
+    const cropHeight = Math.round(opts.crop.height);
+    cropFilter = `crop=${cropWidth}:${cropHeight}:${left}:${top}`;
+    width = cropWidth;
+    height = cropHeight;
+  }
+
+  const shorterEdge = Math.min(width, height);
+  const pad = Math.round(shorterEdge * PAD_RATIO);
+  const fontSize = Math.round(shorterEdge * FONT_SIZE_RATIO);
+  const boxWidth = width - pad * 2;
+  const boxHeight = Math.round(fontSize * BOX_HEIGHT_RATIO);
+
+  const [topPng, bottomPng] = await Promise.all([
+    renderChromeLine(CHROME.topLeft, opts.topColor, fontSize, boxWidth, boxHeight),
+    renderChromeLine(CHROME.bottomLeft, opts.bottomColor, fontSize, boxWidth, boxHeight),
+  ]);
+  await Promise.all([writeFile(topPngPath, topPng), writeFile(bottomPngPath, bottomPng)]);
+
+  const filterParts: string[] = [];
+  if (cropFilter) {
+    filterParts.push(`[0:v]${cropFilter}[cropped]`);
+    filterParts.push(`[cropped][1:v]overlay=${pad}:${pad}[tmp]`);
+  } else {
+    filterParts.push(`[0:v][1:v]overlay=${pad}:${pad}[tmp]`);
+  }
+  filterParts.push(`[tmp][2:v]overlay=${pad}:${height - pad - boxHeight}[outv]`);
+
+  return {
+    workDir,
+    inputPath,
+    topPngPath,
+    bottomPngPath,
+    filterComplex: filterParts.join(";"),
+    duration: probe.duration,
+    hasAudio: probe.hasAudio,
+  };
+}
+
+function buildFfmpegArgs(
+  prepared: PreparedEncode,
+  encode: { crf: number; preset: string },
+  outputPath: string,
+  altText: string,
+  inputDurationLimit?: number,
+): string[] {
+  const args: string[] = ["-y"];
+  if (inputDurationLimit !== undefined) {
+    args.push("-t", String(inputDurationLimit));
+  }
+  args.push(
+    "-i",
+    prepared.inputPath,
+    "-i",
+    prepared.topPngPath,
+    "-i",
+    prepared.bottomPngPath,
+    "-filter_complex",
+    prepared.filterComplex,
+    "-map",
+    "[outv]",
+  );
+  if (prepared.hasAudio) {
+    // Map only the first audio stream (not `0:a?`, which pulls in every
+    // audio-typed stream) and always transcode to AAC instead of stream
+    // copy -- some sources (confirmed with a Mac Photos export) carry a
+    // second audio track whose codec has no valid MP4 tag when copied,
+    // which fails the whole mux ("Could not find tag for codec ... not
+    // currently supported in container"). AAC is always MP4-safe and is
+    // what Instagram expects anyway.
+    args.push("-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k");
+  }
+  args.push(
+    "-c:v",
+    "libx264",
+    "-preset",
+    encode.preset,
+    "-crf",
+    String(encode.crf),
+    "-pix_fmt",
+    "yuv420p",
+    "-metadata",
+    `comment=${altText}`,
+    outputPath,
+  );
+  return args;
+}
+
+export async function applyVideoBrandOverlay(
+  input: Buffer,
+  opts: VideoOverlayOptions,
+): Promise<Buffer> {
+  const prepared = await prepareEncode(input, opts);
+  try {
+    const outputPath = path.join(prepared.workDir, "output.mp4");
+    const { crf, preset } = QUALITY_PRESETS[opts.quality ?? DEFAULT_QUALITY];
+    const args = buildFfmpegArgs(prepared, { crf, preset }, outputPath, opts.altText);
 
     const ffmpegPath = await resolveFfmpeg();
     await run(ffmpegPath, args);
 
     return await readFile(outputPath);
   } finally {
-    await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    await rm(prepared.workDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// Rough, deliberately conservative multipliers of encode time relative to
+// the "balanced" tier's "fast" preset, which is what calibration actually
+// measures. Real x264 preset speed ratios vary by resolution/content/CPU,
+// so these are ballpark community-known figures rounded toward "slower than
+// typical" -- an estimate that's a bit too pessimistic just recommends a
+// safer tier than strictly necessary; one that's too optimistic risks
+// recommending a tier that still times out.
+const RELATIVE_SPEED_VS_BALANCED: Record<QualityKey, number> = {
+  maximum: 2.6,
+  high: 1.5,
+  balanced: 1.0,
+  fast: 0.75,
+};
+
+const CALIBRATION_QUALITY: QualityKey = "balanced";
+
+export interface EncodeEstimate {
+  estimates: Record<QualityKey, number>;
+  fitsBudget: Record<QualityKey, boolean>;
+  recommended: QualityKey;
+}
+
+export async function estimateEncodeTimes(
+  input: Buffer,
+  opts: { crop?: CropRect; topColor: string; bottomColor: string },
+): Promise<EncodeEstimate> {
+  const prepared = await prepareEncode(input, opts);
+  try {
+    const sampleDuration = Math.max(0.5, Math.min(2, prepared.duration * 0.3));
+    const outputPath = path.join(prepared.workDir, "calibration.mp4");
+    const { crf, preset } = QUALITY_PRESETS[CALIBRATION_QUALITY];
+    const args = buildFfmpegArgs(
+      prepared,
+      { crf, preset },
+      outputPath,
+      "calibration",
+      sampleDuration,
+    );
+
+    const ffmpegPath = await resolveFfmpeg();
+    const start = Date.now();
+    await run(ffmpegPath, args);
+    const elapsedSeconds = (Date.now() - start) / 1000;
+
+    const secondsPerVideoSecond = elapsedSeconds / sampleDuration;
+
+    const estimates = {} as Record<QualityKey, number>;
+    const fitsBudget = {} as Record<QualityKey, boolean>;
+    for (const key of QUALITY_KEYS) {
+      const estimate =
+        secondsPerVideoSecond * RELATIVE_SPEED_VS_BALANCED[key] * prepared.duration;
+      estimates[key] = estimate;
+      fitsBudget[key] = estimate <= SAFE_ENCODE_BUDGET_SECONDS;
+    }
+    const recommended = QUALITY_KEYS.find((key) => fitsBudget[key]) ?? "fast";
+
+    return { estimates, fitsBudget, recommended };
+  } finally {
+    await rm(prepared.workDir, { recursive: true, force: true }).catch(() => {});
   }
 }
