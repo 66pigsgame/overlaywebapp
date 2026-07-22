@@ -233,7 +233,14 @@ export async function applyVideoBrandOverlay(
       "[outv]",
     ];
     if (probe.hasAudio) {
-      args.push("-map", "0:a?", "-c:a", "copy");
+      // Map only the first audio stream (not `0:a?`, which pulls in every
+      // audio-typed stream) and always transcode to AAC instead of stream
+      // copy -- some sources (confirmed with a Mac Photos export) carry a
+      // second audio track whose codec has no valid MP4 tag when copied,
+      // which fails the whole mux ("Could not find tag for codec ... not
+      // currently supported in container"). AAC is always MP4-safe and is
+      // what Instagram expects anyway.
+      args.push("-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k");
     }
     const { crf, preset } = QUALITY_PRESETS[opts.quality ?? DEFAULT_QUALITY];
     args.push(
