@@ -3,7 +3,6 @@ import { chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import path from "node:path";
 import ffmpegPathRaw from "ffmpeg-static";
-import ffprobeStatic from "ffprobe-static";
 import { CHROME } from "./colors";
 import { PAD_RATIO, FONT_SIZE_RATIO, BOX_HEIGHT_RATIO } from "./geometry";
 import { renderChromeLine } from "./chrome-render";
@@ -12,17 +11,15 @@ if (!ffmpegPathRaw) {
   throw new Error("ffmpeg-static did not resolve a binary path for this platform");
 }
 const bundledFfmpegPath: string = ffmpegPathRaw;
-const bundledFfprobePath: string = ffprobeStatic.path;
 
 // Vercel's serverless packaging doesn't reliably preserve the executable
 // bit on file-traced binaries, and the bundle's own directory can be
-// read-only at runtime. Copy each binary into /tmp (writable) and chmod
+// read-only at runtime. Copy the binary into /tmp (writable) and chmod
 // it there once per cold start; cached so repeat calls are free.
-const executableCache = new Map<string, Promise<string>>();
+let executableCache: Promise<string> | null = null;
 function ensureExecutable(bundledPath: string): Promise<string> {
-  let cached = executableCache.get(bundledPath);
-  if (!cached) {
-    cached = (async () => {
+  if (!executableCache) {
+    executableCache = (async () => {
       const target = path.join(tmpdir(), path.basename(bundledPath));
       try {
         const info = await stat(target);
@@ -34,9 +31,8 @@ function ensureExecutable(bundledPath: string): Promise<string> {
       await chmod(target, 0o755);
       return target;
     })();
-    executableCache.set(bundledPath, cached);
   }
-  return cached;
+  return executableCache;
 }
 
 export interface CropRect {
@@ -66,13 +62,18 @@ function run(cmd: string, args: string[]): Promise<string> {
   });
 }
 
-interface FfprobeStream {
-  codec_type: string;
-  width?: number;
-  height?: number;
-  duration?: string;
-  tags?: { rotate?: string };
-  side_data_list?: { rotation?: number }[];
+// Runs ffmpeg against a file and returns its stderr text regardless of exit
+// code -- stream/duration/rotation info is printed as soon as ffmpeg opens
+// and analyzes the input, before any decoding happens, so this works even
+// if the process is given no real work to do.
+function runFfmpegStderr(cmd: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args);
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", reject);
+    child.on("close", () => resolve(stderr));
+  });
 }
 
 interface ProbeResult {
@@ -82,47 +83,59 @@ interface ProbeResult {
   hasAudio: boolean;
 }
 
+// Uses ffmpeg's own stderr analysis output instead of a separate ffprobe
+// binary -- ffprobe-static ships a ~340MB all-platforms bundle that hasn't
+// survived Vercel's build pipeline (confirmed via two separate failures:
+// first the traced binary was missing at spawn time, then even an explicit
+// outputFileTracingIncludes entry didn't make the source file exist for a
+// copy). ffmpeg-static's single flat (non-platform-segmented) binary path
+// has traced and run correctly in both of those attempts, so this drops
+// the fragile dependency rather than patching around it again.
 async function probeVideo(filePath: string): Promise<ProbeResult> {
-  const ffprobePath = await ensureExecutable(bundledFfprobePath);
-  const stdout = await run(ffprobePath, [
-    "-v",
-    "error",
-    "-print_format",
-    "json",
-    "-show_format",
-    "-show_streams",
+  const ffmpegPath = await ensureExecutable(bundledFfmpegPath);
+  const stderr = await runFfmpegStderr(ffmpegPath, [
+    "-i",
     filePath,
+    "-t",
+    "0.1",
+    "-f",
+    "null",
+    "-",
   ]);
-  const data = JSON.parse(stdout) as {
-    streams: FfprobeStream[];
-    format?: { duration?: string };
-  };
-  const videoStream = data.streams.find((s) => s.codec_type === "video");
-  const audioStream = data.streams.find((s) => s.codec_type === "audio");
-  if (!videoStream || !videoStream.width || !videoStream.height) {
-    throw new Error("No video stream found");
+
+  const durationMatch = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  const duration = durationMatch
+    ? parseInt(durationMatch[1], 10) * 3600 +
+      parseInt(durationMatch[2], 10) * 60 +
+      parseFloat(durationMatch[3])
+    : 0;
+
+  const videoLineMatch = stderr.match(/Stream #\d+:\d+[^\n]*Video:[^\n]*?(\d{2,5})x(\d{2,5})/);
+  if (!videoLineMatch) {
+    throw new Error(`Could not determine video dimensions from ffmpeg output:\n${stderr}`);
   }
+  let width = parseInt(videoLineMatch[1], 10);
+  let height = parseInt(videoLineMatch[2], 10);
 
-  let width = videoStream.width;
-  let height = videoStream.height;
-
-  // The Display Matrix side-data `rotation` field is what ffmpeg's own
-  // auto-rotate filter insertion actually reads -- the legacy `tags.rotate`
-  // string can report the inverse angle for the same file, confirmed
-  // empirically (a 90deg side-data rotation showed up as tags.rotate="270").
-  const sideDataRotation = videoStream.side_data_list?.find(
-    (sd) => typeof sd.rotation === "number",
-  )?.rotation;
-  const rotateTag = videoStream.tags?.rotate ? parseInt(videoStream.tags.rotate, 10) : undefined;
-  const rotation = sideDataRotation ?? rotateTag ?? 0;
-  const normalizedRotation = ((rotation % 360) + 360) % 360;
+  // The Display Matrix side-data rotation is what ffmpeg's own auto-rotate
+  // filter insertion actually reads -- the legacy `rotate` tag can report
+  // the inverse angle for the same file, confirmed empirically (a 90deg
+  // side-data rotation showed up as a rotate tag of 270).
+  const displayMatrixMatch = stderr.match(/displaymatrix:\s*rotation of\s*(-?[\d.]+)\s*degrees/);
+  const rotateTagMatch = stderr.match(/rotate\s*:\s*(-?\d+)/);
+  const rotation = displayMatrixMatch
+    ? parseFloat(displayMatrixMatch[1])
+    : rotateTagMatch
+      ? parseInt(rotateTagMatch[1], 10)
+      : 0;
+  const normalizedRotation = ((Math.round(rotation) % 360) + 360) % 360;
   if (normalizedRotation === 90 || normalizedRotation === 270) {
     [width, height] = [height, width];
   }
 
-  const duration = parseFloat(data.format?.duration ?? videoStream.duration ?? "0");
+  const hasAudio = /Stream #\d+:\d+[^\n]*: Audio:/.test(stderr);
 
-  return { width, height, duration, hasAudio: !!audioStream };
+  return { width, height, duration, hasAudio };
 }
 
 export interface VideoOverlayOptions {
