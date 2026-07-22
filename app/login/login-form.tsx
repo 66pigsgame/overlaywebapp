@@ -32,7 +32,7 @@ export default function LoginForm() {
     <main className="flex min-h-screen items-center justify-center bg-[#f1ece1] px-6">
       <form onSubmit={onSubmit} className="w-full max-w-xs space-y-4">
         <h1 className="text-center text-sm uppercase tracking-[0.14em] text-[#16140f]">
-          Sax Playing Dog
+          Overlay Webapp
         </h1>
         <input
           type="password"

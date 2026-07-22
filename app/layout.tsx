@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "SPD Overlay",
-  description: "Brand Sax Playing Dog photos for Instagram, full quality.",
+  title: "Overlay Webapp",
+  description: "Brand photos and videos for Instagram, full quality.",
 };
 
 export default function RootLayout({

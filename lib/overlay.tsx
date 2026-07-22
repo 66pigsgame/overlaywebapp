@@ -1,62 +1,14 @@
-import satori from "satori";
 import sharp from "sharp";
-import fs from "node:fs/promises";
-import path from "node:path";
 import { CHROME } from "./colors";
-import { PAD_RATIO, FONT_SIZE_RATIO, LETTER_SPACING_EM, BOX_HEIGHT_RATIO } from "./geometry";
+import { PAD_RATIO, FONT_SIZE_RATIO, BOX_HEIGHT_RATIO } from "./geometry";
 import { buildAltTextXmp } from "./xmp";
+import { renderChromeLine } from "./chrome-render";
 
 export interface CropRect {
   left: number;
   top: number;
   width: number;
   height: number;
-}
-
-let fontDataPromise: Promise<Buffer> | null = null;
-function getFont(): Promise<Buffer> {
-  if (!fontDataPromise) {
-    fontDataPromise = fs.readFile(
-      path.join(process.cwd(), "public/fonts/IBMPlexMono-Regular.ttf"),
-    );
-  }
-  return fontDataPromise;
-}
-
-async function renderChromeLine(
-  text: string,
-  color: string,
-  fontSize: number,
-  boxWidth: number,
-  boxHeight: number,
-): Promise<Buffer> {
-  const fontData = await getFont();
-  const svg = await satori(
-    <div
-      style={{
-        width: `${boxWidth}px`,
-        height: `${boxHeight}px`,
-        display: "flex",
-        alignItems: "center",
-        color,
-        fontFamily: "IBM Plex Mono",
-        fontSize: `${fontSize}px`,
-        fontWeight: 400,
-        letterSpacing: `${fontSize * LETTER_SPACING_EM}px`,
-        textTransform: "uppercase",
-      }}
-    >
-      {text}
-    </div>,
-    {
-      width: boxWidth,
-      height: boxHeight,
-      fonts: [
-        { name: "IBM Plex Mono", data: fontData, weight: 400, style: "normal" },
-      ],
-    },
-  );
-  return sharp(Buffer.from(svg)).png().toBuffer();
 }
 
 export async function applyBrandOverlay(
