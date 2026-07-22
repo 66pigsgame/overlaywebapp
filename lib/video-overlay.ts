@@ -8,6 +8,7 @@ import { createGunzip } from "node:zlib";
 import { CHROME } from "./colors";
 import { PAD_RATIO, FONT_SIZE_RATIO, BOX_HEIGHT_RATIO } from "./geometry";
 import { renderChromeLine } from "./chrome-render";
+import { QUALITY_PRESETS, DEFAULT_QUALITY, type QualityKey } from "./video-quality";
 
 // After three separate failures getting any file-traced binary (ffprobe-static,
 // then ffmpeg-static) to actually exist in the deployed function bundle on
@@ -65,7 +66,6 @@ export interface CropRect {
 }
 
 export const MAX_VIDEO_DURATION_SECONDS = 20;
-export const MAX_VIDEO_LONG_EDGE = 1920;
 
 export class VideoTooLargeError extends Error {}
 
@@ -160,6 +160,7 @@ export interface VideoOverlayOptions {
   topColor: string;
   bottomColor: string;
   altText: string;
+  quality?: QualityKey;
 }
 
 export async function applyVideoBrandOverlay(
@@ -180,11 +181,6 @@ export async function applyVideoBrandOverlay(
     if (probe.duration > MAX_VIDEO_DURATION_SECONDS) {
       throw new VideoTooLargeError(
         `Video is ${probe.duration.toFixed(1)}s, max is ${MAX_VIDEO_DURATION_SECONDS}s`,
-      );
-    }
-    if (Math.max(probe.width, probe.height) > MAX_VIDEO_LONG_EDGE) {
-      throw new VideoTooLargeError(
-        `Video is ${probe.width}x${probe.height}, long edge max is ${MAX_VIDEO_LONG_EDGE}px`,
       );
     }
 
@@ -239,13 +235,14 @@ export async function applyVideoBrandOverlay(
     if (probe.hasAudio) {
       args.push("-map", "0:a?", "-c:a", "copy");
     }
+    const { crf, preset } = QUALITY_PRESETS[opts.quality ?? DEFAULT_QUALITY];
     args.push(
       "-c:v",
       "libx264",
       "-preset",
-      "veryfast",
+      preset,
       "-crf",
-      "18",
+      String(crf),
       "-pix_fmt",
       "yuv420p",
       "-metadata",

@@ -5,6 +5,7 @@ import Cropper, { type Area, type MediaSize, type Size } from "react-easy-crop";
 import { upload } from "@vercel/blob/client";
 import { PALETTE } from "@/lib/colors";
 import { ChromeOverlayPreview } from "@/app/chrome-overlay-preview";
+import { QUALITY_PRESETS, QUALITY_KEYS, DEFAULT_QUALITY, type QualityKey } from "@/lib/video-quality";
 
 type Status = "idle" | "uploading" | "processing" | "done" | "error";
 
@@ -19,6 +20,40 @@ function buildStamps(d: Date) {
   const dateStamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
   const timestamp = `${dateStamp}${pad2(d.getHours())}${pad2(d.getMinutes())}`;
   return { dateStamp, timestamp };
+}
+
+function QualityPicker({
+  value,
+  onChange,
+}: {
+  value: QualityKey;
+  onChange: (key: QualityKey) => void;
+}) {
+  return (
+    <div>
+      <p className="mb-2 text-sm uppercase tracking-[0.1em] text-[#6f6a60]">
+        Quality (try Maximum first, step down only if it times out)
+      </p>
+      <div className="grid grid-cols-2 gap-2">
+        {QUALITY_KEYS.map((key) => {
+          const preset = QUALITY_PRESETS[key];
+          return (
+            <button
+              key={key}
+              type="button"
+              onClick={() => onChange(key)}
+              className={`border px-3 py-2 text-left text-xs ${
+                value === key ? "border-[#16140f]" : "border-[#16140f]/20"
+              }`}
+            >
+              <div className="uppercase tracking-[0.1em]">{preset.label}</div>
+              <div className="mt-0.5 text-[#6f6a60]">{preset.description}</div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function ColorPicker({
@@ -66,6 +101,7 @@ export default function VideoPage() {
   const [cropBoxSize, setCropBoxSize] = useState<Size | null>(null);
   const [topColor, setTopColor] = useState<string>(PALETTE[4].hex);
   const [bottomColor, setBottomColor] = useState<string>(PALETTE[4].hex);
+  const [quality, setQuality] = useState<QualityKey>(DEFAULT_QUALITY);
   const [status, setStatus] = useState<Status>("idle");
   const [resultBlob, setResultBlob] = useState<Blob | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
@@ -134,6 +170,7 @@ export default function VideoPage() {
           blobUrl: blob.url,
           topColor,
           bottomColor,
+          quality,
           dateStamp,
           timestamp,
           crop:
@@ -279,6 +316,7 @@ export default function VideoPage() {
           </>
         )}
 
+        <QualityPicker value={quality} onChange={setQuality} />
         <ColorPicker label="Top line color" value={topColor} onChange={setTopColor} />
         <ColorPicker label="Bottom line color" value={bottomColor} onChange={setBottomColor} />
 

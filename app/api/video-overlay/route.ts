@@ -5,6 +5,7 @@ import {
   VideoTooLargeError,
   type CropRect,
 } from "@/lib/video-overlay";
+import { isQualityKey, DEFAULT_QUALITY, type QualityKey } from "@/lib/video-quality";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -16,6 +17,7 @@ interface VideoOverlayRequestBody {
   dateStamp: string; // YYYYMMDD, for the embedded metadata comment
   timestamp: string; // YYYYMMDDHHMM, for the output filename
   crop?: CropRect;
+  quality?: QualityKey;
 }
 
 export async function POST(req: Request) {
@@ -41,11 +43,14 @@ export async function POST(req: Request) {
     }
     const input = Buffer.from(await sourceRes.arrayBuffer());
 
+    const quality = isQualityKey(body.quality) ? body.quality : DEFAULT_QUALITY;
+
     const output = await applyVideoBrandOverlay(input, {
       crop: body.crop,
       topColor: body.topColor,
       bottomColor: body.bottomColor,
       altText: `sax playing dog brand video from ${body.dateStamp}`,
+      quality,
     });
 
     const result = await put(`${body.timestamp}_Branded_video.mp4`, output, {
