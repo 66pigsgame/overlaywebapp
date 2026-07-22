@@ -185,9 +185,28 @@ export default function VideoPage() {
         }),
       });
 
-      const json = (await res.json()) as { url?: string; error?: string };
-      if (!res.ok || !json.url) {
-        throw new Error(json.error || `Server returned ${res.status}`);
+      if (!res.ok) {
+        if (res.status === 504) {
+          throw new Error(
+            "Processing timed out (over 60s). Try a lower quality tier, or a shorter/smaller video.",
+          );
+        }
+        // A non-OK response might not be JSON at all (e.g. a platform-level
+        // error page for a 502/503), so parse defensively rather than
+        // assuming res.json() will succeed.
+        let message = `Server returned ${res.status}`;
+        try {
+          const errJson = (await res.json()) as { error?: string };
+          if (errJson.error) message = errJson.error;
+        } catch {
+          // Not JSON -- keep the generic status-based message.
+        }
+        throw new Error(message);
+      }
+
+      const json = (await res.json()) as { url?: string };
+      if (!json.url) {
+        throw new Error("Server did not return a result URL");
       }
 
       const outBlob = await (await fetch(json.url)).blob();
